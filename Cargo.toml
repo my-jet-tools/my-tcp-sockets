@@ -16,8 +16,14 @@ rust-extensions = { tag = "0.1.5", git = "https://github.com/MyJetTools/rust-ext
 
 my-tls = { tag = "0.1.5", git = "https://github.com/MyJetTools/my-tls.git", optional = true }
 
-tokio = { version = "*", features = ["full"] }
-tokio-util = "*"
+tokio = { version = "*", features = [
+    "net",
+    "io-util",
+    "time",
+    "sync",
+    "rt",
+    "fs",
+] }
 async-trait = "*"
 futures = "*"
 parking_lot = "*"
