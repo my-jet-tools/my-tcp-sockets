@@ -1,0 +1,134 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use rust_extensions::Logger;
+
+use crate::tcp_connection::{ TcpSocketConnection};
+use crate::{SocketEventCallback, TcpClientInner, TcpSocketSerializer};
+use crate::{TcpContract, TcpSerializerFactory, TcpSerializerState};
+
+use crate::tcp_client::LOG_PROCESS;
+
+pub async fn connect_to_tcp_socket<
+    TContract,
+    TSerializer,
+    TSerializerMetadataFactory,
+    TSocketCallback,
+    TSerializerState,
+>(
+    host_port: &str,
+    connection_id: i32,
+    inner: &TcpClientInner,
+    socket_callback: &mut TSocketCallback,
+    serializer_factory: &Arc<TSerializerMetadataFactory>,
+    logger: &Arc<dyn Logger + Send + Sync + 'static>,
+    socket_context: HashMap<String, String>,
+) 
+ where
+    TContract: TcpContract + Send + Sync + 'static,
+    TSerializer: Send + Sync + 'static + TcpSocketSerializer<TContract, TSerializerState>,
+    TSerializerState: TcpSerializerState<TContract> + Send + Sync + 'static,
+    TSerializerMetadataFactory:
+        TcpSerializerFactory<TContract, TSerializer, TSerializerState> + Send + Sync + 'static,
+    TSocketCallback:
+        SocketEventCallback<TContract, TSerializer, TSerializerState> + Send + 'static,
+{
+    let connect_future = tokio::net::TcpStream::connect(host_port);
+
+    let timeout_result = tokio::time::timeout(inner.connect_timeout, connect_future).await;
+
+    let Ok(tcp_socket_stream_result) = timeout_result else {
+        logger.write_error(
+            crate::tcp_client::LOG_PROCESS.to_string(),
+            "Timeout during establishing connection".to_string(),
+            socket_context.into(),
+        );
+        return;
+    };
+
+    let tcp_stream = match tcp_socket_stream_result {
+        Ok(tcp_stream) => tcp_stream,
+        Err(err) => {
+            logger.write_error(
+                crate::tcp_client::LOG_PROCESS.to_string(),
+                format!("Can not connect to {}. Reason: {}", host_port, err),
+                Some(socket_context.clone()),
+            );
+            return;
+        }
+    };
+
+    logger.write_debug_info(
+        LOG_PROCESS.to_string(),
+        format!("Connected to {}. Id: {}", host_port, connection_id),
+        Some(socket_context.clone()),
+    );
+
+    #[cfg(feature = "with-tls")]
+    let (read_socket, write_socket): (crate::MaybeTlsReadStream, crate::MaybeTlsWriteStream) =
+        if let Some(tls_settings) = inner.settings.get_tls_settings().await {
+            let tls_stream = super::do_handshake(
+                inner.name.as_str(),
+                tcp_stream,
+                tls_settings.server_name,
+                tls_settings.accept_invalid_certs,
+            )
+            .await;
+
+            let tls_stream = match tls_stream {
+                Ok(s) => s,
+                Err(err) => {
+                    logger.write_error(
+                        LOG_PROCESS.to_string(),
+                        format!("TLS handshake failed for {}. Reason: {}", host_port, err),
+                        Some(socket_context.clone()),
+                    );
+                    return;
+                }
+            };
+
+            let (read, write) = tokio::io::split(tls_stream);
+            (
+                crate::MaybeTlsReadStream::Tls(read),
+                crate::MaybeTlsWriteStream::Tls(write),
+            )
+        } else {
+            let (read, write) = tcp_stream.into_split();
+            (read.into(), write.into())
+        };
+
+    #[cfg(not(feature = "with-tls"))]
+    let (read_socket, write_socket): (crate::MaybeTlsReadStream, crate::MaybeTlsWriteStream) = {
+        let (read, write) = tcp_stream.into_split();
+        (read.into(), write.into())
+    };
+
+
+    let connection = Arc::new(
+        TcpSocketConnection::new(
+            inner.name.clone(),
+            Some(write_socket),
+            connection_id,
+            None,
+            logger.clone(),
+            inner.max_send_payload_size,
+            inner.send_timeout,
+            inner.disconnect_timeout,
+            inner.threads_statistics.clone(),
+            serializer_factory.create_serializer().await,
+            serializer_factory.create_serializer_state().await,
+        )
+        .await,
+    );
+
+    super::handle_new_connection(
+        read_socket,
+        connection,
+        logger.clone(),
+        socket_callback,
+        inner.seconds_to_ping,
+        serializer_factory.create_serializer().await,
+        serializer_factory.create_serializer_state().await,
+    )
+    .await;
+}

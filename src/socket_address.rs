@@ -1,0 +1,38 @@
+#[cfg(not(unix))]
+pub type SocketAddress = std::net::SocketAddr;
+
+#[cfg(unix)]
+pub enum SocketAddress {
+    Tcp(std::net::SocketAddr),
+    UnixSocket(tokio::net::unix::SocketAddr),
+}
+#[cfg(unix)]
+impl Into<SocketAddress> for std::net::SocketAddr {
+    fn into(self) -> SocketAddress {
+        SocketAddress::Tcp(self)
+    }
+}
+
+#[cfg(unix)]
+impl Into<SocketAddress> for tokio::net::unix::SocketAddr {
+    fn into(self) -> SocketAddress {
+        SocketAddress::UnixSocket(self)
+    }
+}
+
+#[cfg(unix)]
+impl std::fmt::Display for SocketAddress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SocketAddress::Tcp(addr) => write!(f, "Tcp: {}", addr),
+            SocketAddress::UnixSocket(addr) => write!(f, "UnixSocket: {:?}", addr),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl std::fmt::Debug for SocketAddress {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self)
+    }
+}

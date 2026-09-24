@@ -1,0 +1,302 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::time::Duration;
+
+use parking_lot::Mutex;
+use rust_extensions::{Logger, TaskCompletion};
+use rust_extensions::{background_executor::BackgroundExecutor, date_time::DateTimeAsMicroseconds};
+
+use crate::{
+    ConnectionId, MaybeTlsWriteStream, SocketAddress,  TcpSerializerState, TcpSocketSerializer
+};
+
+use super::{
+    TcpConnectionAbstraction, TcpConnectionInner, TcpConnectionStream,
+};
+
+#[derive(Debug)]
+pub enum TcpThreadStatus {
+    NotStarted,
+    Started,
+    Finished,
+}
+
+impl TcpThreadStatus {
+    pub fn as_i32(&self) -> i32 {
+        match self {
+            TcpThreadStatus::NotStarted => 0,
+            TcpThreadStatus::Started => 1,
+            TcpThreadStatus::Finished => 2,
+        }
+    }
+
+    pub fn is_finished(&self) -> bool {
+        matches!(self, TcpThreadStatus::Finished)
+    }
+}
+
+impl From<i32> for TcpThreadStatus {
+    fn from(val: i32) -> Self {
+        match val {
+            0 => TcpThreadStatus::NotStarted,
+            1 => TcpThreadStatus::Started,
+            2 => TcpThreadStatus::Finished,
+            _ => panic!("Invalid value {} for ThreadStatus", val),
+        }
+    }
+}
+
+
+pub struct NextPacketSync<TContract>{
+    pub task : TaskCompletion<TContract, String>,
+    pub is_my_type: Box<dyn Fn(&TContract)->bool + Send + Sync + 'static>
+}
+
+pub struct NextPacketSyncList<TContract>{
+    items: Mutex<Vec<NextPacketSync<TContract>>>,
+    has_data: AtomicBool,
+}
+
+impl<TContract> Default for NextPacketSyncList<TContract>{
+    fn default() -> Self {
+        Self { items: Default::default(), has_data: Default::default() }
+    }
+}
+
+impl<TContract> NextPacketSyncList<TContract>{
+    pub fn has_data(&self)->bool{
+        self.has_data.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn get_task_completion(&self, contract: &TContract)->Option<TaskCompletion<TContract, String>>{
+        let mut write_access = self.items.lock();
+
+        let item = write_access.first()?;
+        if !(item.is_my_type)(contract) {
+            return None;
+        }
+
+        let next_item = write_access.remove(0);
+
+        if write_access.is_empty() {
+            self.has_data.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        Some(next_item.task)
+    }
+
+}
+
+
+pub struct TcpSocketConnection<TContract, TSerializer, TSerializationMetadata>
+where
+    TContract: Send + Sync + 'static,
+    TSerializer: TcpSocketSerializer<TContract, TSerializationMetadata> + Send + Sync + 'static,
+    TSerializationMetadata: TcpSerializerState<TContract> + Send + Sync + 'static,
+{
+    pub id: ConnectionId,
+    inner: Arc<TcpConnectionInner<TContract, TSerializer, TSerializationMetadata>>,
+    pub (crate) next_packet_synch: NextPacketSyncList<TContract>,
+    pub addr: Option<SocketAddress>,
+    pub dead_disconnect_timeout: Duration,
+    pub logger: Arc<dyn Logger + Send + Sync + 'static>,
+    pub threads_statistics: Arc<crate::ThreadsStatistics>,
+    pub background_executor: Arc<BackgroundExecutor>,
+}
+
+impl<
+        TContract: Send + Sync + 'static,
+        TSerializer: TcpSocketSerializer<TContract, TSerializerState> + Send + Sync + 'static,
+        TSerializerState: TcpSerializerState<TContract> + Send + Sync + 'static,
+    > TcpSocketConnection<TContract, TSerializer, TSerializerState>
+{
+    pub async fn new(
+        master_socket_name: Arc<String>,
+        socket: Option<MaybeTlsWriteStream>,
+        id: ConnectionId,
+        addr: Option<SocketAddress>,
+
+        logger: Arc<dyn Logger + Send + Sync + 'static>,
+        max_send_payload_size: usize,
+        send_timeout: Duration,
+        dead_disconnect_timeout: Duration,
+        threads_statistics: Arc<crate::ThreadsStatistics>,
+        serializer: TSerializer,
+        serializer_state: TSerializerState,
+    ) -> Self {
+        let connection_stream = TcpConnectionStream::new(
+            id,
+            socket,
+            logger.clone(),
+            send_timeout,
+            master_socket_name.clone(),
+        );
+
+        let background_executor = Arc::new(BackgroundExecutor::new(format!(
+            "TcpConnection {}.{}",
+            master_socket_name, id
+        )));
+
+        let inner = Arc::new(TcpConnectionInner::new(
+            connection_stream,
+            max_send_payload_size,
+            logger.clone(),
+            threads_statistics.clone(),
+            Arc::downgrade(&background_executor),
+            serializer,
+            serializer_state,
+        ));
+
+        threads_statistics.connections_objects.increase();
+
+        background_executor.register(inner.clone());
+
+        background_executor.start(logger.clone());
+
+        Self {
+            id,
+            inner,
+            logger,
+            addr,
+            dead_disconnect_timeout,
+            threads_statistics,
+            background_executor,
+            next_packet_synch: Default::default()
+        }
+    }
+
+    pub fn is_connected(&self) -> bool {
+        self.inner.is_connected()
+    }
+
+    pub async fn disconnect(&self) -> bool {
+        self.inner.disconnect().await
+    }
+
+    pub async fn get_log_context(&self) -> HashMap<String, String> {
+        self.inner.get_log_context().await
+    }
+
+    pub fn update_read_thread_status(&self, status: TcpThreadStatus) {
+        self.inner.update_read_thread_status(status);
+    }
+
+    pub fn get_read_thread_status(&self) -> TcpThreadStatus {
+        self.inner.get_read_thread_status()
+    }
+
+    pub fn send(&self, contract: &TContract) -> usize {
+        if !self.inner.is_connected() {
+            return 0;
+        }
+
+        self.inner.push_contract(contract)
+    }
+
+    async fn send_and_await_next_payload_inner(&self, contract: &TContract, is_my_type: impl Fn(&TContract)->bool + Send + Sync + 'static) -> Result<TContract, String> {
+        if !self.inner.is_connected() {
+            return Err("Not Connected".to_string());
+        }
+
+
+        let mut tc: TaskCompletion<TContract, String> = TaskCompletion::new();
+
+        let awaiter = tc.get_awaiter();
+
+        let mut sync_access = self.next_packet_synch.items.lock();
+        sync_access.push(NextPacketSync { task:tc, is_my_type: Box::new(is_my_type)});
+        self.next_packet_synch.has_data.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.inner.push_contract(contract);
+        drop(sync_access);
+
+        awaiter.get_result().await
+    }
+
+    pub async fn send_and_await_next_payload(&self, contract: &TContract, timeout: Duration, is_my_type: impl Fn(&TContract)->bool + Send + Sync + 'static) -> Result<TContract, String> {
+
+        let execute_future = self.send_and_await_next_payload_inner(contract, is_my_type);
+
+        match tokio::time::timeout(timeout, execute_future).await {
+            Ok(result) => result,
+            Err(_) => {
+                self.disconnect().await;
+                Err("send_and_await_next_payload Timeout execution".to_string())
+            }
+        }
+    }
+
+    pub fn send_many(&self, contracts: &[TContract]) -> usize {
+        if !self.inner.is_connected() {
+            return 0;
+        }
+        self.inner.push_many_contracts(contracts)
+    }
+
+    pub fn send_bytes(&self, payload: &[u8]) -> usize {
+        if !self.inner.is_connected() {
+            return 0;
+        }
+
+        self.inner.push_payload(payload)
+    }
+
+    pub async fn set_connection_name(&self, name: String) {
+        let mut write_access = self.inner.stream.lock().await;
+        write_access.set_connection_name(name);
+    }
+
+    pub fn send_ping(&self) -> usize {
+        if !self.inner.is_connected() {
+            return 0;
+        }
+
+        self.inner.send_ping()
+    }
+
+    pub fn statistics(&self) -> &super::ConnectionStatistics {
+        &self.inner.statistics
+    }
+
+    pub fn is_dead(&self, now: DateTimeAsMicroseconds) -> bool {
+        let silence_duration = now
+            .duration_since(self.inner.statistics.last_receive_moment.as_date_time())
+            .as_positive_or_zero();
+
+        silence_duration > self.dead_disconnect_timeout
+    }
+
+    pub fn update_incoming_packet_to_state(&self, contract: &TContract) {
+        let mut write_access = self.inner.buffer_to_send_inner.lock();
+
+        write_access
+            .serializer_state
+            .as_mut()
+            .unwrap()
+            .apply_tcp_contract(contract);
+    }
+}
+
+impl<
+        TContract: Send + Sync + 'static,
+        TSerializer: TcpSocketSerializer<TContract, TSerializationMetadata> + Send + Sync + 'static,
+        TSerializationMetadata: TcpSerializerState<TContract> + Send + Sync + 'static,
+    > Drop for TcpSocketConnection<TContract, TSerializer, TSerializationMetadata>
+{
+    fn drop(&mut self) {
+        self.threads_statistics.connections_objects.decrease();
+    }
+}
+
+#[async_trait::async_trait]
+impl<TContract, TSerializer, TSerializationMetadata> TcpConnectionAbstraction
+    for TcpSocketConnection<TContract, TSerializer, TSerializationMetadata>
+where
+    TContract: Send + Sync + 'static,
+    TSerializer: TcpSocketSerializer<TContract, TSerializationMetadata> + Send + Sync + 'static,
+    TSerializationMetadata: TcpSerializerState<TContract> + Send + Sync + 'static,
+{
+    async fn disconnect(&self) {
+        self.inner.disconnect().await;
+    }
+}
