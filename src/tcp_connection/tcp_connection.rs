@@ -133,10 +133,10 @@ impl<
             master_socket_name.clone(),
         );
 
-        let background_executor = Arc::new(BackgroundExecutor::new(format!(
-            "TcpConnection {}.{}",
-            master_socket_name, id
-        )));
+        let background_executor = Arc::new(BackgroundExecutor::new(
+            format!("TcpConnection {}.{}", master_socket_name, id),
+            logger.clone(),
+        ));
 
         let inner = Arc::new(TcpConnectionInner::new(
             connection_stream,
@@ -152,7 +152,7 @@ impl<
 
         background_executor.register(inner.clone());
 
-        background_executor.start(logger.clone());
+        background_executor.start();
 
         Self {
             id,
