@@ -58,6 +58,14 @@ pub async fn connect_to_tcp_socket<
         }
     };
 
+    if let Err(err) = tcp_stream.set_nodelay(true) {
+        logger.write_warning(
+            LOG_PROCESS.to_string(),
+            format!("Can not set TCP_NODELAY for {}. Reason: {}", host_port, err),
+            Some(socket_context.clone()),
+        );
+    }
+
     logger.write_debug_info(
         LOG_PROCESS.to_string(),
         format!("Connected to {}. Id: {}", host_port, connection_id),

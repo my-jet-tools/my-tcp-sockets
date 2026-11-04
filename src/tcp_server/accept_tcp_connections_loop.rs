@@ -55,6 +55,14 @@ pub async fn accept_tcp_connections_loop<
                     break;
                 }
 
+                if let Err(err) = tcp_stream.set_nodelay(true) {
+                    logger.write_warning(
+                        "Tcp Accept Socket".to_string(),
+                        format!("Can not set TCP_NODELAY for {}. Err:{}", socket_addr, err),
+                        server_socket_log_context.clone(),
+                    );
+                }
+
                 //    let (read_half, write_half) = tcp_stream.into_split();
                 //let mut log_context = HashMap::new();
                 //log_context.insert("Id".to_string(), connection_id.to_string());
